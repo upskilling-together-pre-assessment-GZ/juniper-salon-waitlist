@@ -1,29 +1,19 @@
-import assert from "node:assert/strict";
-import { test } from "node:test";
-import { TestWorkflowEnvironment } from "@temporalio/testing";
-import { Worker } from "@temporalio/worker";
-import { demoWorkflow } from "../src/workflows";
-
-test("the starter Workflow waits for a Signal and completes", async () => {
-  const environment = await TestWorkflowEnvironment.createTimeSkipping();
-  try {
-    const worker = await Worker.create({
-      connection: environment.nativeConnection,
-      taskQueue: "starter-test",
-      workflowsPath: require.resolve("../src/workflows"),
-    });
-    await worker.runUntil(async () => {
-      const handle = await environment.client.workflow.start(demoWorkflow, {
-        workflowId: "starter-test",
-        taskQueue: "starter-test",
-        args: ["starter-test"],
-      });
-      await handle.signal("continueDemo");
-      const result = await handle.result();
-      assert.equal(result.phase, "complete");
-    });
-  } finally {
-    await environment.teardown();
-  }
-});
-
+import assert from 'node:assert/strict';
+import {test} from 'node:test';
+import {randomUUID} from 'node:crypto';
+import {Client,Connection} from '@temporalio/client';
+import {NativeConnection,Worker} from '@temporalio/worker';
+import * as activities from '../src/activities';
+import {salonWorkflow} from '../src/workflows';
+import type {OpeningInput,SalonStatus,ReplyResult,Reply} from '../src/types';
+const input=(seconds=5,fail=false):OpeningInput=>({service:'Haircut',stylist:'Carla',startsAt:new Date(Date.now()+3600000).toISOString(),durationMinutes:45,offerSeconds:seconds,clients:[0,1,2].map(i=>({id:String(i),name:`Client ${i}`,mobile:'555-0100',service:i===2?'Color':'Haircut',stylist:'Any',availableFrom:new Date(Date.now()-3600000).toISOString(),availableTo:new Date(Date.now()+86400000).toISOString(),joinedAt:new Date(Date.now()+i*1000).toISOString(),failDelivery:fail&&i===0}))});
+async function setup(){const connection=await Connection.connect();const native=await NativeConnection.connect();const client=new Client({connection});const queue='test-'+randomUUID();const worker=await Worker.create({connection:native,taskQueue:queue,workflowsPath:require.resolve('../src/workflows'),activities});return {connection,native,client,queue,worker};}
+async function until(h:any,p:(s:SalonStatus)=>boolean):Promise<SalonStatus>{for(let i=0;i<300;i++){try{const s=await h.query('getStatus') as SalonStatus;if(p(s))return s;}catch{}await new Promise(r=>setTimeout(r,20));}throw Error('State not reached');}
+async function run(x:OpeningInput,fn:(h:any)=>Promise<void>){const e=await setup();try{await e.worker.runUntil(async()=>{const h=await e.client.workflow.start(salonWorkflow,{workflowId:'test-'+randomUUID(),taskQueue:e.queue,args:['test-'+randomUUID(),x]});await fn(h);});}finally{await e.connection.close();await e.native.close();}}
+test('exclusive offer reserves once, duplicate and stale replies cannot book',async()=>{await run(input(),async h=>{const s=await until(h,s=>s.phase==='waiting');assert.equal(s.eligible.length,1);const id=s.currentOfferId!;const replies=await Promise.all(['accept','accept'].map(action=>h.executeUpdate('respond',{args:[{offerId:id,action}]}).catch(()=>({accepted:false}))));assert.equal(replies.filter(r=>r.accepted).length,1);const r=await h.result();assert.equal(r.phase,'filled');assert.equal(r.reservedFor,'Client 0');assert.equal(r.offers.length,1);});});
+test('decline advances and rejects previous offer',async()=>{await run(input(),async h=>{const s=await until(h,s=>s.phase==='waiting');await h.executeUpdate('respond',{args:[{offerId:s.currentOfferId,action:'decline'}]});const next=await until(h,s=>s.phase==='waiting'&&s.offers.length===2);const late=await h.executeUpdate('respond',{args:[{offerId:s.currentOfferId,action:'accept'}]});assert.equal(late.accepted,false);await h.executeUpdate('respond',{args:[{offerId:next.currentOfferId,action:'accept'}]});assert.equal((await h.result()).reservedFor,'Client 1');});});
+test('durable timeout advances and exhausted queue becomes unfilled',async()=>{await run(input(.2),async h=>{const r=await h.result();assert.equal(r.phase,'unfilled');assert.deepEqual(r.offers.map((o:any)=>o.outcome),['expired','expired']);});});
+test('delivery failure pauses; staff retry resumes same client and cancellation closes offer',async()=>{await run(input(5,true),async h=>{const s=await until(h,s=>s.phase==='attention');assert.equal(s.offers.length,1);assert.equal(s.eligible.length,1);await h.executeUpdate('staffAction',{args:['retry']});const resumed=await until(h,s=>s.phase==='waiting');assert.equal(resumed.offers[0].attempts,2);await h.executeUpdate('staffAction',{args:['cancel']});const r=await h.result();assert.equal(r.phase,'cancelled');assert.equal(r.offers[0].outcome,'closed');});});
+test('staff skip only advances deliberately; phone fill closes active offer',async()=>{await run(input(5,true),async h=>{await until(h,s=>s.phase==='attention');await h.executeUpdate('staffAction',{args:['skip']});const s=await until(h,s=>s.phase==='waiting');assert.equal(s.offers[0].outcome,'skipped');assert.equal(s.offers[1].client.name,'Client 1');await h.executeUpdate('staffAction',{args:['fill']});assert.equal((await h.result()).reservedFor,'Booked by staff');});});
+test('worker restart preserves pending offer and accepts after recovery',async()=>{const e=await setup();try{let h:any;let offer:string;await e.worker.runUntil(async()=>{h=await e.client.workflow.start(salonWorkflow,{workflowId:'restart-'+randomUUID(),taskQueue:e.queue,args:['restart-'+randomUUID(),input(30)]});offer=(await until(h,s=>s.phase==='waiting')).currentOfferId!;});const worker=await Worker.create({connection:e.native,taskQueue:e.queue,workflowsPath:require.resolve('../src/workflows'),activities});await worker.runUntil(async()=>{const s=await until(h,s=>s.phase==='waiting');assert.equal(s.currentOfferId,offer);await h.executeUpdate('respond',{args:[{offerId:offer,action:'accept'}]});assert.equal((await h.result()).phase,'filled');});}finally{await e.connection.close();await e.native.close();}});
+test('HTTP API rejects invalid inputs and concurrent duplicate opening creation',async()=>{const base='http://localhost:3000';const bad=await fetch(base+'/api/openings',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});assert.equal(bad.status,400);const x=input();x.offerSeconds=900;x.startsAt=new Date(Date.now()+7200000+Math.floor(Math.random()*1000000)).toISOString();const create=()=>fetch(base+'/api/openings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(x)});const replies=await Promise.all([create(),create()]);assert.deepEqual(replies.map(r=>r.status).sort(),[201,409]);const r=replies.find(r=>r.status===201)!;const {id}=await r.json() as {id:string};const closed=await fetch(base+`/api/openings/${id}/action`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'cancel'})});assert.equal(closed.status,200);});

@@ -1,58 +1,18 @@
-import { randomUUID } from "node:crypto";
-import path from "node:path";
-import { Client, Connection } from "@temporalio/client";
-import express, { type NextFunction, type Request, type Response } from "express";
-import type { DemoStatus } from "./types";
-import { demoWorkflow } from "./workflows";
-
-const app = express();
-app.use(express.json());
-app.use(express.static(path.join(process.cwd(), "public")));
-
-let clientPromise: Promise<Client> | undefined;
-function getClient(): Promise<Client> {
-  clientPromise ??= Connection.connect({
-    address: process.env.TEMPORAL_ADDRESS ?? "localhost:7233",
-  }).then((connection) => new Client({ connection, namespace: "default" }));
-  return clientPromise;
-}
-
-app.post("/api/demo", async (_request, response) => {
-  const requestId = randomUUID();
-  const client = await getClient();
-  await client.workflow.start(demoWorkflow, {
-    workflowId: requestId,
-    taskQueue: "assessment-starter",
-    args: [requestId],
-  });
-  response.status(201).json({ requestId });
-});
-
-app.get("/api/demo/:requestId", async (request, response) => {
-  const client = await getClient();
-  const status = await client.workflow
-    .getHandle(request.params.requestId)
-    .query<DemoStatus>("getDemoStatus");
-  response.json(status);
-});
-
-app.post("/api/demo/:requestId/continue", async (request, response) => {
-  const client = await getClient();
-  await client.workflow
-    .getHandle(request.params.requestId)
-    .signal("continueDemo");
-  response.status(202).json({ accepted: true });
-});
-
-app.use(
-  (error: unknown, _request: Request, response: Response, _next: NextFunction) => {
-    console.error(error);
-    response.status(500).json({
-      error: error instanceof Error ? error.message : "Unexpected error",
-    });
-  },
-);
-
-const port = Number(process.env.PORT ?? 3000);
-app.listen(port, () => console.log(`Starter is available at http://localhost:${port}`));
-
+import path from 'node:path';
+import {Client,Connection,WorkflowIdReusePolicy} from '@temporalio/client';
+import express,{type Request,type Response,type NextFunction} from 'express';
+import {salonWorkflow} from './workflows';
+import type {OpeningInput,SalonStatus,ReplyResult} from './types';
+const app=express();app.use(express.json());app.use(express.static(path.join(process.cwd(),'public')));
+let cp:Promise<Client>;function client(){return cp??=Connection.connect({address:process.env.TEMPORAL_ADDRESS??'localhost:7233'}).then(connection=>new Client({connection}));}
+async function status(id:string){const c=await client();const h=c.workflow.getHandle(id);try{return await h.query<SalonStatus>('getStatus');}catch(e){const d=await h.describe();if(d.status.name==='COMPLETED')return await h.result() as SalonStatus;throw e;}}
+app.get('/api/openings',async(_req,res)=>{const c=await client();const all=[];for await(const w of c.workflow.list({query:"WorkflowType = 'salonWorkflow'"})){if(!w.workflowId.startsWith('juniper-'))continue;all.push(await status(w.workflowId));if(all.length>=50)break;}res.json(all);});
+app.post('/api/openings',async(req,res)=>{const x=req.body as OpeningInput;const start=Date.parse(x.startsAt);
+ if(!['Haircut','Color','Blowout'].includes(x.service)||!['Carla','Lena'].includes(x.stylist)||!Number.isFinite(start)||start<=Date.now()||!Number.isFinite(x.durationMinutes)||x.durationMinutes<15||x.durationMinutes>240||![15,900].includes(x.offerSeconds)||!Array.isArray(x.clients)||x.clients.length>100) {res.status(400).json({error:'Choose a future appointment, valid service, stylist, duration, and offer window.'});return;}
+ const ids=new Set();for(const c of x.clients){if(!c||typeof c.id!=='string'||ids.has(c.id)||typeof c.name!=='string'||!c.name.trim()||typeof c.mobile!=='string'||!Number.isFinite(Date.parse(c.availableFrom))||!Number.isFinite(Date.parse(c.availableTo))||!Number.isFinite(Date.parse(c.joinedAt))||!['Any','Carla','Lena'].includes(c.stylist)||!['Haircut','Color','Blowout'].includes(c.service)){res.status(400).json({error:'Check client names, services, preferences, and availability.'});return;}ids.add(c.id);}
+ const id=`juniper-${x.stylist.toLowerCase()}-${start}`;const c=await client();await c.workflow.start(salonWorkflow,{workflowId:id,taskQueue:'juniper-salon',args:[id,x],workflowIdReusePolicy:WorkflowIdReusePolicy.REJECT_DUPLICATE});res.status(201).json({id});});
+app.get('/api/openings/:id',async(req,res)=>res.json(await status(req.params.id)));
+app.post('/api/openings/:id/respond',async(req,res)=>{if(!['accept','decline'].includes(req.body.action)||typeof req.body.offerId!=='string'){res.status(400).json({error:'Invalid reply.'});return;}const s=await status(req.params.id);if(['filled','cancelled','unfilled'].includes(s.phase)){res.status(409).json({accepted:false,message:'This offer is no longer available. Your original appointment has not changed.'});return;}const c=await client();const result=await c.workflow.getHandle(req.params.id).executeUpdate<ReplyResult, [import('./types').Reply]>('respond',{args:[req.body]});res.status(result.accepted?200:409).json(result);});
+app.post('/api/openings/:id/action',async(req,res)=>{if(!['cancel','fill','retry','skip'].includes(req.body.action)){res.status(400).json({error:'Invalid staff action.'});return;}const s=await status(req.params.id);if(['filled','cancelled','unfilled'].includes(s.phase)){res.status(409).json({accepted:false,message:'This opening is already closed.'});return;}const c=await client();const r=await c.workflow.getHandle(req.params.id).executeUpdate<ReplyResult, [string]>('staffAction',{args:[req.body.action]});res.status(r.accepted?200:409).json(r);});
+app.use((e:unknown,_req:Request,res:Response,_next:NextFunction)=>{if(e instanceof Error&&e.name==='WorkflowExecutionAlreadyStartedError'){res.status(409).json({error:'An opening already exists for this stylist and start time. Use the existing opening.'});return;}console.error(e);res.status(500).json({error:'Unable to complete this request. Check that Temporal and the Worker are running, then refresh.'});});
+app.listen(3000,()=>console.log('Juniper Salon: http://localhost:3000'));
