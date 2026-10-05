@@ -58,7 +58,7 @@ npm test
 
 Seven tests run against the local Temporal server on unique test task queues. They cover competing acceptance, declined/late replies, durable expiry and exhaustion, delivery failure and retry, deliberate skip/manual closure, Worker restart recovery, and HTTP input/duplicate-creation protection. Workflow-only tests do not appear in the salon dashboard; the HTTP duplicate-creation test leaves one cancelled test opening visible.
 
-Screenshots in `evidence/` include the actual Temporal Web UI and desktop/mobile prototype views. The customer presentation is added in the presentation step.
+Screenshots in `evidence/` include the actual Temporal Web UI and desktop/mobile prototype views. [Customer presentation (4-page PDF)](output/pdf/Juniper-Salon-Presentation.pdf) covers Lena’s problem, the prototype flow, simulations/exclusions, and a supervised pilot.
 
 ## Scope and practical next step
 
